@@ -350,11 +350,10 @@ static void findValuesUsedBelow(polygeist::BarrierOp op,
   }
 
   for (auto v : crossing) {
-	  if (isa<memref::AllocaOp, LLVM::AllocaOp>(v.getDefiningOp())) {
-		  preserveAllocas.insert(v.getDefiningOp());
+    if (isa<memref::AllocaOp, LLVM::AllocaOp>(v.getDefiningOp())) {
+      preserveAllocas.insert(v.getDefiningOp());
     }
   }
-
 }
 
 /// Returns `true` if the given operation has a BarrierOp transitively nested in
@@ -1260,14 +1259,19 @@ struct DistributeAroundBarrier : public OpRewritePattern<T> {
     llvm::SetVector<Value> usedBelow;
     llvm::SetVector<Operation *> preserveAllocas;
     findValuesUsedBelow(barrier, usedBelow, preserveAllocas);
-    rewriter.setInsertionPoint(op);
 
     llvm::SetVector<Value> minCache;
     // TODO make it an option I guess
-    bool MIN_CUT_OPTIMIZATION = false;
+    bool MIN_CUT_OPTIMIZATION = true;
     if (MIN_CUT_OPTIMIZATION) {
 
       minCutCache(barrier, usedBelow, minCache);
+
+      LLVM_DEBUG(
+        DBGS() << "[distribute] min cut cache optimisation: "
+        << "preserveAllocas: " << preserveAllocas.size() << ", "
+        << "usedBelow: " << usedBelow.size() << ", "
+        << "minCache: " << minCache.size() << "\n");
 
       BlockAndValueMapping mapping;
       for (Value v : minCache)
@@ -1276,10 +1280,12 @@ struct DistributeAroundBarrier : public OpRewritePattern<T> {
       // Recalculate values used below the barrier up to available ones
       rewriter.setInsertionPointAfter(barrier);
       std::function<void(Value)> recalculateVal;
-      recalculateVal = [&recalculateVal, &mapping, &rewriter](Value v) {
+      recalculateVal = [&recalculateVal, &barrier, &mapping,
+                        &rewriter](Value v) {
+        auto op = v.getDefiningOp();
         if (mapping.contains(v)) {
           return;
-        } else if (auto op = v.getDefiningOp()) {
+        } else if (op && op->getBlock() == barrier->getBlock()) {
           for (Value operand : op->getOperands()) {
             recalculateVal(operand);
           }
@@ -1290,15 +1296,27 @@ struct DistributeAroundBarrier : public OpRewritePattern<T> {
           mapping.map(v, v);
         }
       };
-      for (auto v : usedBelow)
+      for (auto v : usedBelow) {
         recalculateVal(v);
+        // Remap the uses of the recalculated val below the barrier
+        for (auto &u : llvm::make_early_inc_range(v.getUses())) {
+          auto user = u.getOwner();
+          while (user->getBlock() != barrier->getBlock())
+            user = user->getBlock()->getParentOp();
+          if (barrier->isBeforeInBlock(user)) {
+            rewriter.startRootUpdate(user);
+            u.set(mapping.lookup(v));
+            rewriter.finalizeRootUpdate(user);
+          }
+        }
+      }
     } else {
       minCache = usedBelow;
     }
 
     // TODO should we integrate this in minCutCache?
     for (auto alloca : preserveAllocas) {
-	    minCache.remove(alloca->getResult(0));
+      minCache.remove(alloca->getResult(0));
     }
 
     SmallVector<Value> iterCounts;
@@ -1309,6 +1327,7 @@ struct DistributeAroundBarrier : public OpRewritePattern<T> {
     T outerLoop = nullptr;
     scf::ExecuteRegionOp outerEx = nullptr;
 
+    rewriter.setInsertionPoint(op);
     if (splitSubLoop(op, rewriter, barrier, iterCounts, preLoop, postLoop,
                      outerBlock, outerLoop, outerEx)
             .failed())
