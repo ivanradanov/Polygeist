@@ -1267,11 +1267,10 @@ struct DistributeAroundBarrier : public OpRewritePattern<T> {
 
       minCutCache(barrier, usedBelow, minCache);
 
-      LLVM_DEBUG(
-        DBGS() << "[distribute] min cut cache optimisation: "
-        << "preserveAllocas: " << preserveAllocas.size() << ", "
-        << "usedBelow: " << usedBelow.size() << ", "
-        << "minCache: " << minCache.size() << "\n");
+      LLVM_DEBUG(DBGS() << "[distribute] min cut cache optimisation: "
+                        << "preserveAllocas: " << preserveAllocas.size() << ", "
+                        << "usedBelow: " << usedBelow.size() << ", "
+                        << "minCache: " << minCache.size() << "\n");
 
       BlockAndValueMapping mapping;
       for (Value v : minCache)
@@ -1434,27 +1433,30 @@ struct DistributeAroundBarrier : public OpRewritePattern<T> {
       }
     }
 
-    // Store values in the min cache immediately when ready.
+    // Store values in the min cache immediately when ready and reload them
+    // after the barrier
     for (auto pair : llvm::zip(minCache, minCacheAllocations)) {
       Value v = std::get<0>(pair);
       Value alloc = std::get<1>(pair);
+      // Store
+      rewriter.setInsertionPointAfter(v.getDefiningOp());
+      rewriter.create<memref::StoreOp>(v.getLoc(), v, alloc,
+                                       preLoop.getBody()->getArguments());
+      // Reload
+      rewriter.setInsertionPointAfter(barrier);
+      Value reloaded = rewriter.create<memref::LoadOp>(
+          v.getLoc(), alloc, preLoop.getBody()->getArguments());
       for (auto &u : llvm::make_early_inc_range(v.getUses())) {
         auto user = u.getOwner();
         while (user->getBlock() != barrier->getBlock())
           user = user->getBlock()->getParentOp();
 
         if (barrier->isBeforeInBlock(user)) {
-          rewriter.setInsertionPoint(u.getOwner());
-          Value reloaded = rewriter.create<memref::LoadOp>(
-              user->getLoc(), alloc, preLoop.getBody()->getArguments());
           rewriter.startRootUpdate(user);
           u.set(reloaded);
           rewriter.finalizeRootUpdate(user);
         }
       }
-      rewriter.setInsertionPointAfter(v.getDefiningOp());
-      rewriter.create<memref::StoreOp>(v.getLoc(), v, alloc,
-                                       preLoop.getBody()->getArguments());
     }
 
     // Insert the terminator for the new loop immediately before the barrier.
