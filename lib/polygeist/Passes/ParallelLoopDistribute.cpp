@@ -189,7 +189,8 @@ static bool is_recomputable(Operation &op) {
   if (auto memInterface = dyn_cast<MemoryEffectOpInterface>(&op)) {
     return memInterface.hasNoEffect();
   } else {
-    return !op.hasTrait<OpTrait::HasRecursiveSideEffects>();
+    return false;
+    // return !op.hasTrait<OpTrait::HasRecursiveSideEffects>();
   }
 
   // return !op.hasTrait<OpTrait::HasRecursiveSideEffects>();
@@ -880,13 +881,23 @@ struct InterchangeIfPForLoad : public OpRewritePattern<T> {
 /// created at the start of `newForLoop`.
 template <typename T, typename ForType>
 static void moveBodiesFor(PatternRewriter &rewriter, T op, ForType forLoop,
-                          ForType newForLoop) {
+                          ForType newForLoop, bool preserveRecomputes = false) {
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(newForLoop.getBody());
   auto newParallel = rewriter.cloneWithoutRegions<T>(op);
   newParallel.getRegion().push_back(new Block());
   for (auto a : op.getBody()->getArguments())
     newParallel.getBody()->addArgument(a.getType());
+  if (preserveRecomputes) {
+    BlockAndValueMapping mapping;
+    mapping.map(op.getBody()->getArguments(),
+                newParallel.getBody()->getArguments());
+    rewriter.setInsertionPoinToEnd(newParallel.getBody());
+    for (auto it = op.getBody()->begin(); dyn_cast<ForType>(*it) != forLoop;
+         ++it) {
+      rewriter.clone(*it, mapping);
+    }
+  }
   rewriter.setInsertionPointToEnd(newParallel.getBody());
   rewriter.clone(*op.getBody()->getTerminator());
 
@@ -964,7 +975,7 @@ struct InterchangeForPForLoad : public OpRewritePattern<T> {
     auto forOp = dyn_cast<ForType>(op.getBody()->front().getNextNode());
     if (!loadOp || !forOp || !inBound(forOp, loadOp.result()) ||
         loadOp.indices() != op.getBody()->getArguments()) {
-      LLVM_DEBUG(DBGS() << "[interchange-load] expected pfor(load, for/if)");
+      LLVM_DEBUG(DBGS() << "[interchange-load] expected pfor(load, for/if)\n");
       return failure();
     }
 
@@ -991,6 +1002,65 @@ struct InterchangeForPForLoad : public OpRewritePattern<T> {
     auto newForLoop = cloneWithoutResults(forOp, rewriter, mapping);
 
     moveBodiesFor(rewriter, op, forOp, newForLoop);
+    return success();
+  }
+};
+
+/// Checks if the block consists of recomputable operations (either ops with no
+/// side effects or polygeist cache loads) and with the last operation of type
+/// LastOpType which has a nested barrier
+template <typename ParallelOpType, typename LastOpType>
+bool canInterchangeParallelWithLastOp(string Pattern, ParallelOpType op) {
+  if (std::next(op.getBody()->begin(), 1) == op.getBody()->end()) {
+    LLVM_DEBUG(DBGS() << "[" << Pattern
+                      << "] expected one or more nested ops\n");
+    return false;
+  }
+
+  // The actualy last op is a yield, get the one before that
+  auto lastOpIt = op.getBody()->back()->getPrevNode();
+  auto lastOp = dyn_cast<LastOpType>(lastOpIt);
+  if (!forOp) {
+    LLVM_DEBUG(DBGS() << "[" << Pattern << "] unexpected last op type\n");
+    return false;
+  }
+
+  SmallVector<BlockArgument> args;
+  if (!hasNestedBarrier(containedOp, args)) {
+    LLVM_DEBUG(DBGS() << "[" << Pattern << "] no nested barrier\n");
+    return false;
+  }
+
+  for (auto it = op.getBody()->begin(); it != containedOpIt; ++it) {
+    if (!is_recomputable(*op) && !isa<polygeist::CacheLoad>(&*op)) {
+      LLVM_DEBUG(DBGS() << "[" << Pattern << "] found a nonrecomputable op\n");
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/// Interchanges a parallel for loop with a for loop with preceeding value
+/// recomputations
+template <typename T, typename ForType>
+struct InterchangeForPForRecomputable : public OpRewritePattern<T> {
+  using OpRewritePattern<T>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(T op,
+                                PatternRewriter &rewriter) const override {
+    if (canInterchangeParallelWithLastOp<T, ForType>(
+            "interchange-recomputable-for", op)
+            .failed())
+      return failure();
+
+    auto lastOpIt = op.getBody()->back()->getPrevNode();
+    auto forLoop = dyn_cast<ForType>(lastOpIt);
+    assert(forLoop);
+
+    auto newForLoop = cloneWithoutResults(forLoop, rewriter);
+    moveBodiesFor(rewriter, op, forLoop, newForLoop, true);
+
     return success();
   }
 };
@@ -1444,7 +1514,7 @@ struct DistributeAroundBarrier : public OpRewritePattern<T> {
                                        preLoop.getBody()->getArguments());
       // Reload
       rewriter.setInsertionPointAfter(barrier);
-      Value reloaded = rewriter.create<memref::LoadOp>(
+      Value reloaded = rewriter.create<polygeist::CacheLoad>(
           v.getLoc(), alloc, preLoop.getBody()->getArguments());
       for (auto &u : llvm::make_early_inc_range(v.getUses())) {
         auto user = u.getOwner();
@@ -1868,36 +1938,38 @@ struct CPUifyPass : public SCFCPUifyBase<CPUifyPass> {
   void runOnFunction() override {
     if (method == "distribute") {
       OwningRewritePatternList patterns(&getContext());
-      patterns.insert<Reg2MemFor<scf::ForOp>, Reg2MemFor<AffineForOp>,
-                      Reg2MemWhile, Reg2MemIf<scf::IfOp>, Reg2MemIf<AffineIfOp>,
-                      WrapForWithBarrier, WrapAffineForWithBarrier,
-                      WrapIfWithBarrier, WrapWhileWithBarrier,
+      patterns.insert<
+          Reg2MemFor<scf::ForOp>, Reg2MemFor<AffineForOp>, Reg2MemWhile,
+          Reg2MemIf<scf::IfOp>, Reg2MemIf<AffineIfOp>, WrapForWithBarrier,
+          WrapAffineForWithBarrier, WrapIfWithBarrier, WrapWhileWithBarrier,
 
-                      InterchangeForPFor<scf::ParallelOp, scf::ForOp>,
-                      InterchangeForPFor<AffineParallelOp, scf::ForOp>,
-                      InterchangeForPForLoad<scf::ParallelOp, scf::ForOp>,
-                      InterchangeForPForLoad<AffineParallelOp, scf::ForOp>,
-                      InterchangeIfPFor<scf::ParallelOp, scf::IfOp>,
-                      InterchangeIfPFor<AffineParallelOp, scf::IfOp>,
-                      InterchangeIfPForLoad<scf::ParallelOp, scf::IfOp>,
-                      InterchangeIfPForLoad<AffineParallelOp, scf::IfOp>,
+          InterchangeForPFor<scf::ParallelOp, scf::ForOp>,
+          InterchangeForPFor<AffineParallelOp, scf::ForOp>,
+          InterchangeForPForLoad<scf::ParallelOp, scf::ForOp>,
+          InterchangeForPForLoad<AffineParallelOp, scf::ForOp>,
+          InterchangeForPForRecomputable<scf::ParallelOp, scf::ForOp>,
+          InterchangeForPForRecomputable<AffineParallelOp, scf::ForOp>,
+          InterchangeIfPFor<scf::ParallelOp, scf::IfOp>,
+          InterchangeIfPFor<AffineParallelOp, scf::IfOp>,
+          InterchangeIfPForLoad<scf::ParallelOp, scf::IfOp>,
+          InterchangeIfPForLoad<AffineParallelOp, scf::IfOp>,
 
-                      InterchangeForPFor<scf::ParallelOp, AffineForOp>,
-                      InterchangeForPFor<AffineParallelOp, AffineForOp>,
-                      InterchangeForPForLoad<scf::ParallelOp, AffineForOp>,
-                      InterchangeForPForLoad<AffineParallelOp, AffineForOp>,
-                      InterchangeIfPFor<scf::ParallelOp, AffineIfOp>,
-                      InterchangeIfPFor<AffineParallelOp, AffineIfOp>,
-                      InterchangeIfPForLoad<scf::ParallelOp, AffineIfOp>,
-                      InterchangeIfPForLoad<AffineParallelOp, AffineIfOp>,
+          InterchangeForPFor<scf::ParallelOp, AffineForOp>,
+          InterchangeForPFor<AffineParallelOp, AffineForOp>,
+          InterchangeForPForLoad<scf::ParallelOp, AffineForOp>,
+          InterchangeForPForLoad<AffineParallelOp, AffineForOp>,
+          InterchangeIfPFor<scf::ParallelOp, AffineIfOp>,
+          InterchangeIfPFor<AffineParallelOp, AffineIfOp>,
+          InterchangeIfPForLoad<scf::ParallelOp, AffineIfOp>,
+          InterchangeIfPForLoad<AffineParallelOp, AffineIfOp>,
 
-                      InterchangeWhilePFor<scf::ParallelOp>,
-                      InterchangeWhilePFor<AffineParallelOp>,
-                      // NormalizeLoop,
-                      NormalizeParallel,
-                      // RotateWhile,
-                      DistributeAroundBarrier<scf::ParallelOp>,
-                      DistributeAroundBarrier<AffineParallelOp>>(&getContext());
+          InterchangeWhilePFor<scf::ParallelOp>,
+          InterchangeWhilePFor<AffineParallelOp>,
+          // NormalizeLoop,
+          NormalizeParallel,
+          // RotateWhile,
+          DistributeAroundBarrier<scf::ParallelOp>,
+          DistributeAroundBarrier<AffineParallelOp>>(&getContext());
       GreedyRewriteConfig config;
       config.maxIterations = 142;
       if (failed(applyPatternsAndFoldGreedily(getFunction(),
