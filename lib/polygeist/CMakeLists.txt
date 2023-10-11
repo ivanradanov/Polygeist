@@ -19,3 +19,5 @@ MLIRSCFTransforms
 )
 add_subdirectory(Passes)
 add_subdirectory(ExecutionEngine)
+add_subdirectory(Tools)
+add_subdirectory(LLVMTools)
