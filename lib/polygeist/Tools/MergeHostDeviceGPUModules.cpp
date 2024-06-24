@@ -23,7 +23,7 @@ LogicalResult mlir::polygeist::mergeDeviceIntoHost(ModuleOp hostModule,
   llvm::SmallVector<LLVM::LLVMFuncOp> launchFuncs;
   hostModule->walk([&](LLVM::LLVMFuncOp funcOp) {
     auto symName = funcOp.getName();
-    if (symName.startswith(kernelPrefix))
+    if (symName.starts_with(kernelPrefix))
       launchFuncs.push_back(funcOp);
   });
 
