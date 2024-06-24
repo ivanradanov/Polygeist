@@ -1,9 +1,9 @@
-// RUN: clang++ -c %s -o %s.device.ll %stdinclude --cuda-gpu-arch=sm_80 -emit-llvm --cuda-device-only -Xclang -load -Xclang ../Polygeist/build.debug/lib/PolygeistCUDALaunchFixUp.so -Xclang -fpass-plugin=../Polygeist/build.debug/lib/PolygeistCUDALaunchFixUp.so
-// RUN: clang++ -c %s -o %s.host.ll %stdinclude --cuda-gpu-arch=sm_80 -emit-llvm --cuda-host-only -Xclang -load -Xclang ../Polygeist/build.debug/lib/PolygeistCUDALaunchFixUp.so -Xclang -fpass-plugin=../Polygeist/build.debug/lib/PolygeistCUDALaunchFixUp.so
+// RUN: clang++ -c %s -o %s.device.ll %stdinclude --cuda-gpu-arch=sm_80 -emit-llvm --cuda-device-only -Xclang -load -Xclang /scr/ivan/src/Polygeist/build.debug/lib/PolygeistCUDALaunchFixUp.so -Xclang -fpass-plugin=/scr/ivan/src/Polygeist/build.debug/lib/PolygeistCUDALaunchFixUp.so
+// RUN: clang++ -c %s -o %s.host.ll %stdinclude --cuda-gpu-arch=sm_80 -emit-llvm --cuda-host-only -Xclang -load -Xclang /scr/ivan/src/Polygeist/build.debug/lib/PolygeistCUDALaunchFixUp.so -Xclang -fpass-plugin=/scr/ivan/src/Polygeist/build.debug/lib/PolygeistCUDALaunchFixUp.so
 // RUN: mlir-translate --import-llvm %s.device.ll -o %s.device.mlir
 // RUN: mlir-translate --import-llvm %s.host.ll -o %s.host.mlir
 // RUN: polygeist-merge-gpu-modules --host %s.host.mlir --device %s.device.mlir -o %s.merged.mlir
-// RUN: car %s.merged.mlir | FileCheck %s
+// RUN: cat %s.merged.mlir | FileCheck %s
 //
 // To build an executable:
 // mlir-opt %s.merged.mlir --pass-pipeline="builtin.module(gpu.module(convert-gpu-to-nvvm), gpu-to-llvm, gpu-module-to-binary{format=binary} )" -o %s.merged-nvvm.mlir
@@ -21,6 +21,7 @@ extern "C" __global__ void foo(float *A)
 int main(void)
 {
   float *C = NULL;
+  float D;
   cudaMalloc((void **)&C, 1024 * 10 * sizeof(float));
   foo<<<1, 1>>>(C);
   cudaMemcpy(&D, C, sizeof(float), cudaMemcpyDeviceToHost);
